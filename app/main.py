@@ -52,6 +52,7 @@ class MemorySample:
 	swap: int
 	cpu_percent: float
 	threads: int
+	handles: int = -1
 
 
 class ProcessMonitor(QThread):
@@ -103,6 +104,13 @@ class ProcessMonitor(QThread):
 				except Exception:
 					threads = 0
 
+				handles = -1
+				if IS_WINDOWS:
+					try:
+						handles = getattr(self._process, "num_handles", lambda: -1)()
+					except Exception:
+						handles = -1
+
 				sample = MemorySample(
 					timestamp=time.time(),
 					rss=mem.get("rss", 0),
@@ -112,6 +120,7 @@ class ProcessMonitor(QThread):
 					swap=mem.get("swap", 0),
 					cpu_percent=cpu_percent,
 					threads=threads,
+					handles=handles,
 				)
 				self.sampled.emit(sample)
 			except psutil.NoSuchProcess:
@@ -244,10 +253,18 @@ class OverviewTab(QWidget):
 		def fmt(b: int) -> str:
 			return f"{b / (1024*1024):.1f} MB"
 
-		self.summary_label.setText(
-			f"RSS: {fmt(sample.rss)} | PSS: {fmt(sample.pss)} | USS: {fmt(sample.uss)} | "
-			f"Swap: {fmt(sample.swap)} | VMS: {fmt(sample.vms)} | 线程: {sample.threads} | CPU: {sample.cpu_percent:.1f}%"
-		)
+		parts = [
+			f"RSS: {fmt(sample.rss)}",
+			f"PSS: {fmt(sample.pss)}",
+			f"USS: {fmt(sample.uss)}",
+			f"Swap: {fmt(sample.swap)}",
+			f"VMS: {fmt(sample.vms)}",
+			f"线程: {sample.threads}",
+			f"CPU: {sample.cpu_percent:.1f}%",
+		]
+		if IS_WINDOWS and sample.handles >= 0:
+			parts.append(f"句柄: {sample.handles}")
+		self.summary_label.setText(" | ".join(parts))
 
 	def _update_plot(self) -> None:
 		if not self.history:
@@ -597,8 +614,8 @@ class PythonTab(QWidget):
 class MainWindow(QMainWindow):
 	def __init__(self) -> None:
 		super().__init__()
-		self.setWindowTitle("进程内存分析助手")
-		self.resize(1200, 800)
+		self.setWindowTitle("进程内存分析助手（定向监控）")
+		self.resize(1100, 760)
 		try:
 			self.setWindowIcon(QIcon.fromTheme("utilities-system-monitor"))
 		except Exception:
@@ -608,37 +625,27 @@ class MainWindow(QMainWindow):
 
 		central = QWidget()
 		self.setCentralWidget(central)
-		main_layout = QHBoxLayout(central)
+		main_layout = QVBoxLayout(central)
 
-		splitter = QSplitter(Qt.Horizontal)
-		main_layout.addWidget(splitter)
+		# Target selector
+		selector = QHBoxLayout()
+		self.name_edit = QLineEdit()
+		self.name_edit.setPlaceholderText("进程名（可选，用于校验或辅助查找，如 chrome.exe）")
+		self.pid_edit = QLineEdit()
+		self.pid_edit.setPlaceholderText("PID（必填或与进程名同时填写）")
+		self.pid_edit.setMaximumWidth(200)
+		self.attach_btn = QPushButton("附加")
+		self.stop_btn = QPushButton("停止监控")
+		selector.addWidget(QLabel("进程名:"))
+		selector.addWidget(self.name_edit)
+		selector.addWidget(QLabel("PID:"))
+		selector.addWidget(self.pid_edit)
+		selector.addWidget(self.attach_btn)
+		selector.addWidget(self.stop_btn)
+		selector.addStretch(1)
+		main_layout.addLayout(selector)
 
-		# Left panel: process list
-		left = QWidget()
-		left_layout = QVBoxLayout(left)
-
-		search_row = QHBoxLayout()
-		self.search_edit = QLineEdit()
-		self.search_edit.setPlaceholderText("搜索进程名/PID/用户…")
-		self.only_python_cb = QCheckBox("仅 Python")
-		self.refresh_btn = QPushButton("刷新")
-		search_row.addWidget(self.search_edit)
-		search_row.addWidget(self.only_python_cb)
-		search_row.addWidget(self.refresh_btn)
-		left_layout.addLayout(search_row)
-
-		self.proc_table = QTableWidget()
-		self.proc_table.setColumnCount(5)
-		self.proc_table.setHorizontalHeaderLabels(["PID", "名称", "用户", "RSS(MB)", "CPU%"])
-		self.proc_table.horizontalHeader().setStretchLastSection(True)
-		left_layout.addWidget(self.proc_table)
-
-		splitter.addWidget(left)
-
-		# Right panel: tabs
-		right = QWidget()
-		right_layout = QVBoxLayout(right)
-
+		# Tabs
 		self.tabs = QTabWidget()
 		self.overview_tab = OverviewTab()
 		self.maps_tab = MapsTab()
@@ -649,78 +656,65 @@ class MainWindow(QMainWindow):
 		self.tabs.addTab(self.maps_tab, "映射")
 		self.tabs.addTab(self.diag_tab, "诊断")
 		self.tabs.addTab(self.python_tab, "Python 分析")
-
-		right_layout.addWidget(self.tabs)
-		splitter.addWidget(right)
-		splitter.setSizes([400, 800])
+		main_layout.addWidget(self.tabs)
 
 		# connections
-		self.refresh_btn.clicked.connect(self.refresh_processes)
-		self.search_edit.textChanged.connect(lambda _: self.refresh_processes())
-		self.only_python_cb.stateChanged.connect(lambda _: self.refresh_processes())
-		self.proc_table.itemSelectionChanged.connect(self._on_process_selected)
+		self.attach_btn.clicked.connect(self._on_attach_clicked)
+		self.stop_btn.clicked.connect(lambda: self.overview_tab._on_stop())
 		self.overview_tab.snapshotTaken.connect(lambda s: self._on_snapshot_taken(s))
 		# forward samples to diagnostics
 		def forward_sample(sample: MemorySample) -> None:
 			self.diag_tab.push_sample(sample)
 		self.overview_tab._on_sampled = lambda s: (OverviewTab._on_sampled(self.overview_tab, s), forward_sample(s))
 
-		# Initial load
-		self.refresh_processes()
-
-	def refresh_processes(self) -> None:
-		query = self.search_edit.text().strip().lower()
-		only_py = self.only_python_cb.isChecked()
-
-		processes: List[Tuple[int, str, str, float, float]] = []
-		for proc in psutil.process_iter(["pid", "name", "username", "memory_info", "cmdline"]):
+	def _on_attach_clicked(self) -> None:
+		name = self.name_edit.text().strip()
+		pid_text = self.pid_edit.text().strip()
+		pid: Optional[int] = None
+		if pid_text:
 			try:
-				pid = proc.info.get("pid")
-				name = proc.info.get("name") or ""
-				user = proc.info.get("username") or ""
-				rss = getattr(proc.info.get("memory_info"), "rss", 0) or 0
-				cmdline_list = proc.info.get("cmdline") or []
-				cmdline = " ".join(cmdline_list).lower()
-				if only_py and ("python" not in (name.lower()) and "python" not in cmdline):
+				pid = int(pid_text)
+			except ValueError:
+				QMessageBox.warning(self, "无效的 PID", "PID 必须是整数")
+				return
+		if not pid and not name:
+			QMessageBox.information(self, "提示", "请至少填写 PID，或同时填写进程名与 PID 进行校验。")
+			return
+		# If both provided, validate they match
+		if pid and name:
+			try:
+				p = psutil.Process(pid)
+				real_name = (p.name() or "").strip()
+				if real_name and real_name.lower() != name.lower():
+					ret = QMessageBox.question(self, "名称不匹配", f"PID {pid} 的实际名称为 {real_name}，与输入的 {name} 不同，仍然附加？")
+					if ret != QMessageBox.Yes:
+						return
+			except psutil.NoSuchProcess:
+				QMessageBox.information(self, "提示", "目标进程不存在或已退出")
+				return
+			except Exception as exc:
+				QMessageBox.warning(self, "警告", f"验证进程名失败: {exc}")
+
+		# If only name provided (rare), try to find highest RSS exact match
+		if not pid and name:
+			candidates: List[psutil.Process] = []
+			for pr in psutil.process_iter(["pid", "name", "memory_info"]):
+				try:
+					if (pr.info.get("name") or "").lower() == name.lower():
+						candidates.append(psutil.Process(pr.info["pid"]))
+				except Exception:
 					continue
-				if query:
-					if not (
-						query in name.lower()
-						or query in user.lower()
-						or query in str(pid)
-						or (query in cmdline)
-					):
-						continue
-				processes.append((pid, name, user, rss / (1024 * 1024), 0.0))
-			except (psutil.NoSuchProcess, psutil.AccessDenied):
-				continue
-			except Exception:
-				continue
+			if not candidates:
+				QMessageBox.information(self, "未找到", f"未找到名称为 {name} 的进程")
+				return
+			candidates.sort(key=lambda x: getattr(getattr(x, "memory_info", lambda: type('M', (), {"rss":0})())(), "rss", 0), reverse=True)
+			pid = candidates[0].pid
+			self.pid_edit.setText(str(pid))
 
-		processes.sort(key=lambda x: x[3], reverse=True)
+		if not pid:
+			QMessageBox.information(self, "提示", "无法确定要附加的进程 PID")
+			return
 
-		self.proc_table.setRowCount(0)
-		for pid, name, user, rss_mb, cpu in processes[:300]:
-			row = self.proc_table.rowCount()
-			self.proc_table.insertRow(row)
-			for col, val in enumerate([pid, name, user, f"{rss_mb:.1f}", f"{cpu:.1f}"]):
-				item = QTableWidgetItem(str(val))
-				if col in (0, 3, 4):
-					item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-				self.proc_table.setItem(row, col, item)
-
-	def _on_process_selected(self) -> None:
-		items = self.proc_table.selectedItems()
-		if not items:
-			return
-		row = items[0].row()
-		pid_item = self.proc_table.item(row, 0)
-		if not pid_item:
-			return
-		try:
-			pid = int(pid_item.text())
-		except ValueError:
-			return
 		self.current_pid = pid
 		self.overview_tab.attach_to_pid(pid)
 		self.maps_tab.attach_to_pid(pid)
@@ -734,7 +728,7 @@ class MainWindow(QMainWindow):
 			self,
 			"快照",
 			f"时间: {time.strftime('%H:%M:%S', time.localtime(sample.timestamp))}\n"
-			f"RSS: {fmt(sample.rss)}\nPSS: {fmt(sample.pss)}\nUSS: {fmt(sample.uss)}\nSwap: {fmt(sample.swap)}\nVMS: {fmt(sample.vms)}\n线程: {sample.threads}\nCPU: {sample.cpu_percent:.1f}%",
+			f"RSS: {fmt(sample.rss)}\nPSS: {fmt(sample.pss)}\nUSS: {fmt(sample.uss)}\nSwap: {fmt(sample.swap)}\nVMS: {fmt(sample.vms)}\n线程: {sample.threads}\nCPU: {sample.cpu_percent:.1f}%" + (f"\n句柄: {sample.handles}" if IS_WINDOWS and sample.handles >= 0 else ""),
 		)
 
 
