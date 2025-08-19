@@ -35,7 +35,11 @@ from PyQt5.QtWidgets import (
 
 import pyqtgraph as pg
 
-from .smaps import read_smaps, aggregate_smaps
+IS_WINDOWS = (os.name == 'nt') or sys.platform.startswith('win')
+if IS_WINDOWS:
+	from .winmaps import read_win_maps as read_maps, aggregate_win_maps as aggregate_maps
+else:
+	from .smaps import read_smaps as read_maps, aggregate_smaps as aggregate_maps
 
 
 @dataclass
@@ -135,9 +139,9 @@ class ProcessMonitor(QThread):
 				if isinstance(value, (int, float)):
 					info[key] = int(value)
 		except Exception:
-			# Fallback using smaps for PSS if accessible
+			# Fallback using memory maps aggregation if accessible
 			try:
-				totals, _ = aggregate_smaps(process.pid)
+				totals, _ = aggregate_maps(process.pid)
 				info["pss"] = int(totals.get("pss_kb", 0) * 1024)
 				info["uss"] = int(totals.get("private_kb", 0) * 1024)
 				info["swap"] = int(totals.get("swap_kb", 0) * 1024)
@@ -268,7 +272,7 @@ class MapsTab(QWidget):
 		layout = QVBoxLayout(self)
 
 		controls = QHBoxLayout()
-		self.refresh_btn = QPushButton("读取内存映射 (smaps)")
+		self.refresh_btn = QPushButton("读取内存映射")
 		self.export_btn = QPushButton("导出 CSV")
 		controls.addWidget(self.refresh_btn)
 		controls.addWidget(self.export_btn)
@@ -306,10 +310,10 @@ class MapsTab(QWidget):
 			QMessageBox.warning(self, "提示", "请先选择进程")
 			return
 		try:
-			regions = read_smaps(self.pid)
-			totals, grouped = aggregate_smaps(self.pid, regions)
+			regions = read_maps(self.pid)
+			totals, grouped = aggregate_maps(self.pid, regions)
 		except PermissionError:
-			QMessageBox.critical(self, "权限不足", "无法读取 /proc/<pid>/smaps。请尝试使用 root 或选择同一用户的进程。")
+			QMessageBox.critical(self, "权限不足", "无法读取内存映射信息。请在具备权限的情况下运行或选择同一用户的进程。")
 			return
 		except FileNotFoundError:
 			QMessageBox.information(self, "提示", "进程已退出")
@@ -351,9 +355,9 @@ class MapsTab(QWidget):
 
 	def _on_export(self) -> None:
 		if self.table.rowCount() == 0:
-			QMessageBox.information(self, "提示", "没有数据可导出，请先读取 smaps")
+			QMessageBox.information(self, "提示", "没有数据可导出，请先读取映射")
 			return
-		path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", os.path.expanduser("~/smaps.csv"), "CSV Files (*.csv)")
+		path, _ = QFileDialog.getSaveFileName(self, "导出 CSV", os.path.expanduser("~/maps.csv"), "CSV Files (*.csv)")
 		if not path:
 			return
 		try:
@@ -437,7 +441,7 @@ class DiagnosticsTab(QWidget):
 				text_lines.append("疑似内存泄漏/未释放：最近一段时间 RSS 持续上升且速率较高")
 
 		try:
-			totals, grouped = aggregate_smaps(self.pid)
+			totals, grouped = aggregate_maps(self.pid)
 			pss_total = totals.get("pss_kb", 0.0)
 			heap = grouped.get("[heap]", {}).get("pss_kb", 0.0)
 			anon = grouped.get("[anon]", {}).get("pss_kb", 0.0)
