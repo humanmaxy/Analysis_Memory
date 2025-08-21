@@ -32,22 +32,109 @@ class XRayEnhancer:
         self.processing_steps = []
         
     def load_image(self, image_path):
-        """加载图像"""
+        """加载图像 - 增强版本，支持中文路径和各种编码问题"""
         try:
-            # 读取图像
-            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-            if image is None:
-                raise ValueError("无法读取图像文件")
+            print(f"尝试加载图像: {image_path}")
+            
+            # 方法1: 使用cv2.imdecode处理中文路径
+            success, image = self._load_with_numpy_decode(image_path)
+            if success:
+                print("使用numpy解码方法成功加载")
+            else:
+                # 方法2: 使用PIL加载
+                success, image = self._load_with_pil(image_path)
+                if success:
+                    print("使用PIL方法成功加载")
+                else:
+                    # 方法3: 复制到临时文件
+                    success, image = self._load_with_temp_copy(image_path)
+                    if success:
+                        print("使用临时文件方法成功加载")
+            
+            if not success:
+                raise ValueError("所有加载方法都失败了")
             
             # 归一化到0-1范围
             self.original_image = image.astype(np.float64) / 255.0
             self.processing_steps = [("原始图像", self.original_image.copy())]
             
+            print(f"图像加载成功! 尺寸: {image.shape}, 数据类型: {image.dtype}")
             return True
             
         except Exception as e:
             print(f"加载图像失败: {e}")
             return False
+    
+    def _load_with_numpy_decode(self, image_path):
+        """使用numpy解码方法加载图像"""
+        try:
+            # 检查文件是否存在
+            if not os.path.exists(image_path):
+                return False, None
+            
+            # 检查文件大小
+            if os.path.getsize(image_path) == 0:
+                return False, None
+            
+            # 读取文件数据
+            with open(image_path, 'rb') as f:
+                file_data = f.read()
+            
+            # 转换为numpy数组
+            nparr = np.frombuffer(file_data, np.uint8)
+            
+            # 使用cv2.imdecode解码
+            image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+            
+            return image is not None, image
+            
+        except Exception as e:
+            print(f"numpy解码方法失败: {e}")
+            return False, None
+    
+    def _load_with_pil(self, image_path):
+        """使用PIL方法加载图像"""
+        try:
+            from PIL import Image
+            
+            with Image.open(image_path) as pil_image:
+                # 转换为灰度图
+                if pil_image.mode != 'L':
+                    pil_image = pil_image.convert('L')
+                
+                # 转换为numpy数组
+                image = np.array(pil_image)
+                
+                return True, image
+                
+        except Exception as e:
+            print(f"PIL方法失败: {e}")
+            return False, None
+    
+    def _load_with_temp_copy(self, image_path):
+        """使用临时文件复制方法加载图像"""
+        try:
+            import tempfile
+            import shutil
+            
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            # 复制文件
+            shutil.copy2(image_path, temp_path)
+            
+            # 使用OpenCV读取
+            image = cv2.imread(temp_path, cv2.IMREAD_GRAYSCALE)
+            
+            # 删除临时文件
+            os.unlink(temp_path)
+            
+            return image is not None, image
+            
+        except Exception as e:
+            print(f"临时文件方法失败: {e}")
+            return False, None
     
     def adaptive_noise_reduction(self, image, method='multi_scale'):
         """自适应噪声减少"""
