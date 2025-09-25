@@ -1,5 +1,10 @@
 import os
 import torch
+
+# CRITICAL: Apply patches BEFORE importing rfdetr
+from patch_matcher import apply_comprehensive_patches
+apply_comprehensive_patches()
+
 from rfdetr import RFDETRBase
 from debug_utils import setup_cuda_debugging, check_cuda_memory
 
