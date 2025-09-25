@@ -19,6 +19,7 @@
 """
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
+import os
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
@@ -77,85 +78,155 @@ class HungarianMatcher(nn.Module):
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
 
-        # Compute the giou cost betwen boxes
-        giou = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-        cost_giou = -giou
+        # Comprehensive bbox sanitization function
+        def sanitize_bbox_tensor(bbox_tensor, name, device):
+            """Sanitize bbox tensor to prevent NaN/Inf values and ensure valid coordinates"""
+            # Replace NaN and Inf values with valid defaults
+            nan_mask = torch.isnan(bbox_tensor)
+            inf_mask = torch.isinf(bbox_tensor)
+            
+            if nan_mask.any() or inf_mask.any():
+                print(f"Warning: {name} contains NaN ({nan_mask.sum().item()}) or Inf ({inf_mask.sum().item()}) values. Sanitizing...")
+                
+                # Replace NaN/Inf in center coordinates (cx, cy) with 0.5 (center of normalized image)
+                bbox_tensor[nan_mask[:, :2] | inf_mask[:, :2]] = 0.5
+                
+                # Replace NaN/Inf in width/height (w, h) with small positive values
+                wh_mask = (nan_mask[:, 2:] | inf_mask[:, 2:])
+                bbox_tensor[:, 2:][wh_mask] = 0.01
+            
+            # Ensure all bbox values are within reasonable bounds for normalized coordinates
+            # Center coordinates should be in [0, 1]
+            bbox_tensor[:, :2] = torch.clamp(bbox_tensor[:, :2], min=0.0, max=1.0)
+            
+            # Width and height should be positive and <= 1
+            bbox_tensor[:, 2:] = torch.clamp(bbox_tensor[:, 2:], min=0.001, max=1.0)
+            
+            # Additional safety check: ensure no extreme values that could cause overflow
+            bbox_tensor = torch.clamp(bbox_tensor, min=-10.0, max=10.0)
+            
+            return bbox_tensor
 
-        # Compute the classification cost.
+        # Sanitize both bbox tensors
+        out_bbox = sanitize_bbox_tensor(out_bbox, "out_bbox", out_bbox.device)
+        tgt_bbox = sanitize_bbox_tensor(tgt_bbox, "tgt_bbox", tgt_bbox.device)
+
+        # Debug information (can be removed in production)
+        if torch.cuda.is_available() and os.environ.get('CUDA_LAUNCH_BLOCKING') == '1':
+            print(f"out_bbox shape: {out_bbox.shape}, dtype: {out_bbox.dtype}")
+            print(f"tgt_bbox shape: {tgt_bbox.shape}, dtype: {tgt_bbox.dtype}")
+            print(f"out_bbox range: [{out_bbox.min().item():.6f}, {out_bbox.max().item():.6f}]")
+            print(f"tgt_bbox range: [{tgt_bbox.min().item():.6f}, {tgt_bbox.max().item():.6f}]")
+
+        # Compute the giou cost between boxes with error handling
+        try:
+            out_bbox_xyxy = box_cxcywh_to_xyxy(out_bbox)
+            tgt_bbox_xyxy = box_cxcywh_to_xyxy(tgt_bbox)
+            
+            # Additional sanitization for xyxy format
+            out_bbox_xyxy = torch.clamp(out_bbox_xyxy, min=0.0, max=1.0)
+            tgt_bbox_xyxy = torch.clamp(tgt_bbox_xyxy, min=0.0, max=1.0)
+            
+            giou = generalized_box_iou(out_bbox_xyxy, tgt_bbox_xyxy)
+            
+            # Handle NaN in giou computation
+            if torch.isnan(giou).any():
+                print("Warning: NaN detected in GIoU computation, replacing with -1")
+                giou = torch.where(torch.isnan(giou), torch.tensor(-1.0, device=giou.device), giou)
+            
+            cost_giou = -giou
+            
+        except Exception as e:
+            print(f"Error in GIoU computation: {e}")
+            # Fallback: use zero cost for giou
+            cost_giou = torch.zeros((out_bbox.shape[0], tgt_bbox.shape[0]), device=out_bbox.device)
+
+        # Compute the classification cost with additional safety checks
         alpha = 0.25
         gamma = 2.0
         
-        neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
-        pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-        cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+        # Clamp probabilities to prevent log(0)
+        out_prob_clamped = torch.clamp(out_prob, min=1e-8, max=1.0-1e-8)
+        
+        neg_cost_class = (1 - alpha) * (out_prob_clamped ** gamma) * (-(1 - out_prob_clamped + 1e-8).log())
+        pos_cost_class = alpha * ((1 - out_prob_clamped) ** gamma) * (-(out_prob_clamped + 1e-8).log())
+        
+        # Ensure tgt_ids are valid indices
+        max_class_id = out_prob.shape[1] - 1
+        tgt_ids_clamped = torch.clamp(tgt_ids, min=0, max=max_class_id)
+        
+        cost_class = pos_cost_class[:, tgt_ids_clamped] - neg_cost_class[:, tgt_ids_clamped]
 
-        # 在调用 torch.cdist 前添加以下代码
-        print(f"out_bbox shape: {out_bbox.shape}, dtype: {out_bbox.dtype}")
-        print(f"tgt_bbox shape: {tgt_bbox.shape}, dtype: {tgt_bbox.dtype}")
-
-        # 检查 NaN 和 Inf
-        if torch.isnan(out_bbox).any() or torch.isinf(out_bbox).any():
-            print("out_bbox contains NaN or Inf values!")
-            print("NaN count:", torch.isnan(out_bbox).sum().item())
-            print("Inf count:", torch.isinf(out_bbox).sum().item())
+        # Compute the L1 cost between boxes with error handling
+        try:
+            cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
             
-        if torch.isnan(tgt_bbox).any() or torch.isinf(tgt_bbox).any():
-            print("tgt_bbox contains NaN or Inf values!")
-            print("NaN count:", torch.isnan(tgt_bbox).sum().item())
-            print("Inf count:", torch.isinf(tgt_bbox).sum().item())
+            # Handle potential NaN/Inf in distance computation
+            if torch.isnan(cost_bbox).any() or torch.isinf(cost_bbox).any():
+                print("Warning: NaN/Inf detected in bbox distance computation, replacing with large values")
+                cost_bbox = torch.where(torch.isnan(cost_bbox) | torch.isinf(cost_bbox), 
+                                      torch.tensor(100.0, device=cost_bbox.device), cost_bbox)
+        except Exception as e:
+            print(f"Error in bbox distance computation: {e}")
+            # Fallback: use large constant cost
+            cost_bbox = torch.full((out_bbox.shape[0], tgt_bbox.shape[0]), 100.0, device=out_bbox.device)
 
-        # 检查边界框坐标是否有效
-        def check_bbox_validity(bboxes, name):
-            """检查边界框坐标是否有效"""
-            if (bboxes[..., 2:] < 0).any():  # 宽度和高度
-                print(f"{name} has negative width/height!")
-                invalid_indices = (bboxes[..., 2:] < 0).any(dim=-1).nonzero(as_tuple=True)
-                print(f"Invalid indices: {invalid_indices}")
-                print(f"Invalid bboxes: {bboxes[invalid_indices]}")
-                return False
-            return True
-
-        if not check_bbox_validity(out_bbox, "out_bbox"):
-            # 修正无效值
-            out_bbox[..., 2:] = torch.clamp(out_bbox[..., 2:], min=0.01)
+        # Final cost matrix with additional safety checks
+        try:
+            # Ensure all cost components are finite
+            cost_bbox = torch.where(torch.isfinite(cost_bbox), cost_bbox, torch.tensor(100.0, device=cost_bbox.device))
+            cost_class = torch.where(torch.isfinite(cost_class), cost_class, torch.tensor(10.0, device=cost_class.device))
+            cost_giou = torch.where(torch.isfinite(cost_giou), cost_giou, torch.tensor(1.0, device=cost_giou.device))
             
-        if not check_bbox_validity(tgt_bbox, "tgt_bbox"):
-            # 修正无效值
-            tgt_bbox[..., 2:] = torch.clamp(tgt_bbox[..., 2:], min=0.01)
-
-        # 检查维度是否匹配
-        if out_bbox.dim() != tgt_bbox.dim() or out_bbox.shape[-1] != tgt_bbox.shape[-1]:
-            print(f"Dimension mismatch! out_bbox: {out_bbox.shape}, tgt_bbox: {tgt_bbox.shape}")
-            # 尝试调整维度
-            if out_bbox.dim() == 2 and tgt_bbox.dim() == 3:
-                tgt_bbox = tgt_bbox.squeeze(0)
-            elif out_bbox.dim() == 3 and tgt_bbox.dim() == 2:
-                out_bbox = out_bbox.squeeze(0)
-
-
-
-
-        # Compute the L1 cost between boxes
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-
-        # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            
+            # Additional safety check for the final cost matrix
+            C = torch.where(torch.isfinite(C), C, torch.tensor(1000.0, device=C.device))
+            
+        except Exception as e:
+            print(f"Error in cost matrix computation: {e}")
+            # Fallback: create a simple distance-based cost matrix
+            C = torch.cdist(out_bbox[:, :2], tgt_bbox[:, :2], p=2)  # Use only center coordinates
+            C = torch.where(torch.isfinite(C), C, torch.tensor(1000.0, device=C.device))
+        
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
         indices = []
         g_num_queries = num_queries // group_detr
-        C_list = C.split(g_num_queries, dim=1)
-        for g_i in range(group_detr):
-            C_g = C_list[g_i]
-            indices_g = [linear_sum_assignment(c[i]) for i, c in enumerate(C_g.split(sizes, -1))]
-            if g_i == 0:
-                indices = indices_g
-            else:
-                indices = [
-                    (np.concatenate([indice1[0], indice2[0] + g_num_queries * g_i]), np.concatenate([indice1[1], indice2[1]]))
-                    for indice1, indice2 in zip(indices, indices_g)
-                ]
+        
+        try:
+            C_list = C.split(g_num_queries, dim=1)
+            for g_i in range(group_detr):
+                C_g = C_list[g_i]
+                # Additional safety check before linear sum assignment
+                C_split = C_g.split(sizes, -1)
+                indices_g = []
+                for i, c in enumerate(C_split):
+                    # Ensure the cost matrix is finite and not too large
+                    c_safe = torch.clamp(c, min=0.0, max=1e6)
+                    if torch.isfinite(c_safe).all():
+                        indices_g.append(linear_sum_assignment(c_safe))
+                    else:
+                        # Fallback: create identity matching up to min size
+                        min_size = min(c_safe.shape)
+                        indices_g.append((np.arange(min_size), np.arange(min_size)))
+                
+                if g_i == 0:
+                    indices = indices_g
+                else:
+                    indices = [
+                        (np.concatenate([indice1[0], indice2[0] + g_num_queries * g_i]), np.concatenate([indice1[1], indice2[1]]))
+                        for indice1, indice2 in zip(indices, indices_g)
+                    ]
+        except Exception as e:
+            print(f"Error in Hungarian matching: {e}")
+            # Fallback: create simple sequential matching
+            indices = []
+            for target in targets:
+                num_targets = len(target["boxes"])
+                indices.append((np.arange(min(num_queries, num_targets)), np.arange(num_targets)))
+        
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 

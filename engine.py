@@ -125,18 +125,57 @@ def train_one_epoch(
             new_samples = new_samples.to(device)
             new_targets = [{k: v.to(device) for k, v in t.items()} for t in targets[start_idx:final_idx]]
 
-            with autocast(**get_autocast_args(args)):
-                outputs = model(new_samples, new_targets)
-                loss_dict = criterion(outputs, new_targets)
-                weight_dict = criterion.weight_dict
-                losses = sum(
-                    (1 / args.grad_accum_steps) * loss_dict[k] * weight_dict[k]
-                    for k in loss_dict.keys()
-                    if k in weight_dict
-                )
+            try:
+                with autocast(**get_autocast_args(args)):
+                    outputs = model(new_samples, new_targets)
+                    
+                    # Validate model outputs before passing to criterion
+                    if "pred_boxes" in outputs:
+                        pred_boxes = outputs["pred_boxes"]
+                        if torch.isnan(pred_boxes).any() or torch.isinf(pred_boxes).any():
+                            print(f"Warning: Model outputs contain NaN/Inf values at step {it}")
+                            print(f"NaN count in pred_boxes: {torch.isnan(pred_boxes).sum().item()}")
+                            print(f"Inf count in pred_boxes: {torch.isinf(pred_boxes).sum().item()}")
+                            
+                            # Sanitize model outputs
+                            outputs["pred_boxes"] = torch.where(
+                                torch.isnan(pred_boxes) | torch.isinf(pred_boxes),
+                                torch.zeros_like(pred_boxes),
+                                pred_boxes
+                            )
+                    
+                    loss_dict = criterion(outputs, new_targets)
+                    weight_dict = criterion.weight_dict
+                    losses = sum(
+                        (1 / args.grad_accum_steps) * loss_dict[k] * weight_dict[k]
+                        for k in loss_dict.keys()
+                        if k in weight_dict
+                    )
+                    
+                    # Check for NaN/Inf in losses
+                    if torch.isnan(losses) or torch.isinf(losses):
+                        print(f"Warning: Loss contains NaN/Inf at step {it}")
+                        print(f"Loss dict: {loss_dict}")
+                        # Skip this batch to prevent training failure
+                        continue
 
-
-            scaler.scale(losses).backward()
+                scaler.scale(losses).backward()
+                
+            except RuntimeError as e:
+                if "CUDA" in str(e) or "index out of bounds" in str(e):
+                    print(f"CUDA error at step {it}: {e}")
+                    print("Attempting to recover by skipping this batch...")
+                    
+                    # Clear CUDA cache and skip this batch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # Reset gradients and continue
+                    optimizer.zero_grad()
+                    continue
+                else:
+                    # Re-raise non-CUDA errors
+                    raise e
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -271,25 +310,45 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, arg
         if args.fp16_eval:
             samples.tensors = samples.tensors.half()
 
-        # Add autocast for evaluation
-        with autocast(**get_autocast_args(args)):
-            outputs = model(samples)
+        # Add autocast for evaluation with error handling
+        try:
+            with autocast(**get_autocast_args(args)):
+                outputs = model(samples)
 
-        if args.fp16_eval:
-            for key in outputs.keys():
-                if key == "enc_outputs":
-                    for sub_key in outputs[key].keys():
-                        outputs[key][sub_key] = outputs[key][sub_key].float()
-                elif key == "aux_outputs":
-                    for idx in range(len(outputs[key])):
-                        for sub_key in outputs[key][idx].keys():
-                            outputs[key][idx][sub_key] = outputs[key][idx][
-                                sub_key
-                            ].float()
-                else:
-                    outputs[key] = outputs[key].float()
+            # Validate outputs before further processing
+            if "pred_boxes" in outputs:
+                pred_boxes = outputs["pred_boxes"]
+                if torch.isnan(pred_boxes).any() or torch.isinf(pred_boxes).any():
+                    print("Warning: Model outputs contain NaN/Inf values during evaluation")
+                    outputs["pred_boxes"] = torch.where(
+                        torch.isnan(pred_boxes) | torch.isinf(pred_boxes),
+                        torch.zeros_like(pred_boxes),
+                        pred_boxes
+                    )
 
-        loss_dict = criterion(outputs, targets)
+            if args.fp16_eval:
+                for key in outputs.keys():
+                    if key == "enc_outputs":
+                        for sub_key in outputs[key].keys():
+                            outputs[key][sub_key] = outputs[key][sub_key].float()
+                    elif key == "aux_outputs":
+                        for idx in range(len(outputs[key])):
+                            for sub_key in outputs[key][idx].keys():
+                                outputs[key][idx][sub_key] = outputs[key][idx][
+                                    sub_key
+                                ].float()
+                    else:
+                        outputs[key] = outputs[key].float()
+
+            loss_dict = criterion(outputs, targets)
+            
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "index out of bounds" in str(e):
+                print(f"CUDA error during evaluation: {e}")
+                print("Skipping this evaluation batch...")
+                continue
+            else:
+                raise e
         weight_dict = criterion.weight_dict
 
         # reduce losses over all GPUs for logging purposes

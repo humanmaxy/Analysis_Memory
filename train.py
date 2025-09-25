@@ -1,9 +1,13 @@
 import os
 import torch
 from rfdetr import RFDETRBase
-import os
+from debug_utils import setup_cuda_debugging, check_cuda_memory
+
 os.environ["PYTHONUTF8"] = "1"
 def main():
+    # 设置调试环境
+    setup_cuda_debugging()
+    
     # 打印环境信息
     print(f"PyTorch版本: {torch.__version__}")
     print(f"CUDA可用: {torch.cuda.is_available()}")
@@ -12,6 +16,7 @@ def main():
         print(f"CUDA版本: {torch.version.cuda}")
         print(f"GPU名称: {torch.cuda.get_device_name(0)}")
         print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB")
+        check_cuda_memory()
     
     # 模型配置
     MODEL_PATH = "F:/code/rf-detr/rf-detr-base.pth"
@@ -35,12 +40,8 @@ def main():
     
 
 if __name__ == '__main__':
-    # 设置环境变量
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # 有助于更精确的错误定位
-    # os.environ['PYTHONWARNINGS'] = "ignore"
-    
     # 设置PyTorch的并行计算线程数
-    # torch.set_num_threads(1)
+    torch.set_num_threads(4)  # 设置合理的线程数
     
     # 运行主函数
     main()
