@@ -1,23 +1,5 @@
-# ------------------------------------------------------------------------
-# RF-DETR
-# Copyright (c) 2025 Roboflow. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Modified from LW-DETR (https://github.com/Atten4Vis/LW-DETR)
-# Copyright (c) 2024 Baidu. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Conditional DETR (https://github.com/Atten4Vis/ConditionalDETR)
-# Copyright (c) 2021 Microsoft. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
-# ------------------------------------------------------------------------
-
 """
-Modules to compute the matching cost and solve the corresponding LSAP.
+Fixed matcher module to replace the buggy one in the installed rfdetr package
 """
 import os
 import numpy as np
@@ -25,23 +7,75 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
-from rfdetr.util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+def box_cxcywh_to_xyxy(x):
+    """Convert bbox from center format to corner format"""
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+         (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=-1)
 
-class HungarianMatcher(nn.Module):
-    """This class computes an assignment between the targets and the predictions of the network
-    For efficiency reasons, the targets don't include the no_object. Because of this, in general,
-    there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
-    while the others are un-matched (and thus treated as non-objects).
+def generalized_box_iou(boxes1, boxes2):
     """
+    Generalized IoU from https://giou.stanford.edu/
+    The boxes should be in [x0, y0, x1, y1] format
+    Returns a [N, M] pairwise matrix, where N = len(boxes1) and M = len(boxes2)
+    """
+    # degenerate boxes gives inf / nan results
+    # so do an early check
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    
+    iou, union = box_iou(boxes1, boxes2)
+
+    lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
+
+    wh = (rb - lt).clamp(min=0)  # [N,M,2]
+    area = wh[:, :, 0] * wh[:, :, 1]
+
+    return iou - (area - union) / area
+
+def box_iou(boxes1, boxes2):
+    """
+    Return intersection-over-union (Jaccard index) of boxes.
+    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
+    Arguments:
+        boxes1 (Tensor[N, 4])
+        boxes2 (Tensor[M, 4])
+    Returns:
+        iou (Tensor[N, M]): the NxM matrix containing the pairwise IoU values for every element in boxes1 and boxes2
+    """
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,M,2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+    union = area1[:, None] + area2 - inter
+
+    iou = inter / union
+    return iou, union
+
+def box_area(boxes):
+    """
+    Computes the area of a set of bounding boxes, which are specified by its
+    (x1, y1, x2, y2) coordinates.
+    Arguments:
+        boxes (Tensor[N, 4]): boxes for which the area will be computed. They
+            are expected to be in (x1, y1, x2, y2) format
+    Returns:
+        area (Tensor[N]): area for each box
+    """
+    return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+class FixedHungarianMatcher(nn.Module):
+    """Fixed version of HungarianMatcher with proper bounds checking"""
 
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, focal_alpha: float = 0.25, use_pos_only: bool = False,
                  use_position_modulated_cost: bool = False):
-        """Creates the matcher
-        Params:
-            cost_class: This is the relative weight of the classification error in the matching cost
-            cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
-            cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
-        """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
@@ -51,23 +85,7 @@ class HungarianMatcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, targets, group_detr=1):
-        """ Performs the matching
-        Params:
-            outputs: This is a dict that contains at least these entries:
-                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
-                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
-            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
-                 "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
-                           objects in the target) containing the class labels
-                 "boxes": Tensor of dim [num_target_boxes, 4] containing the target box coordinates
-            group_detr: Number of groups used for matching.
-        Returns:
-            A list of size batch_size, containing tuples of (index_i, index_j) where:
-                - index_i is the indices of the selected predictions (in order)
-                - index_j is the indices of the corresponding selected targets (in order)
-            For each batch element, it holds:
-                len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
-        """
+        """ Performs the matching with comprehensive error handling """
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         # We flatten to compute the cost matrices in a batch
@@ -151,11 +169,29 @@ class HungarianMatcher(nn.Module):
         neg_cost_class = (1 - alpha) * (out_prob_clamped ** gamma) * (-(1 - out_prob_clamped + 1e-8).log())
         pos_cost_class = alpha * ((1 - out_prob_clamped) ** gamma) * (-(out_prob_clamped + 1e-8).log())
         
-        # Ensure tgt_ids are valid indices
-        max_class_id = out_prob.shape[1] - 1
-        tgt_ids_clamped = torch.clamp(tgt_ids, min=0, max=max_class_id)
+        # CRITICAL FIX: Ensure tgt_ids are valid indices
+        num_classes = out_prob.shape[1]
+        print(f"DEBUG: num_classes={num_classes}, tgt_ids min={tgt_ids.min().item()}, max={tgt_ids.max().item()}")
         
-        cost_class = pos_cost_class[:, tgt_ids_clamped] - neg_cost_class[:, tgt_ids_clamped]
+        # Clamp target IDs to valid range [0, num_classes-1]
+        tgt_ids_clamped = torch.clamp(tgt_ids, min=0, max=num_classes-1)
+        
+        # Additional safety check
+        if (tgt_ids >= num_classes).any() or (tgt_ids < 0).any():
+            print(f"WARNING: Invalid target IDs detected! Original range: [{tgt_ids.min().item()}, {tgt_ids.max().item()}]")
+            print(f"Clamping to valid range: [0, {num_classes-1}]")
+            invalid_mask = (tgt_ids >= num_classes) | (tgt_ids < 0)
+            print(f"Number of invalid IDs: {invalid_mask.sum().item()}")
+        
+        # Use the clamped IDs for indexing
+        try:
+            cost_class = pos_cost_class[:, tgt_ids_clamped] - neg_cost_class[:, tgt_ids_clamped]
+        except Exception as e:
+            print(f"Error in classification cost computation: {e}")
+            print(f"pos_cost_class shape: {pos_cost_class.shape}")
+            print(f"tgt_ids_clamped shape: {tgt_ids_clamped.shape}, values: {tgt_ids_clamped}")
+            # Fallback: use zero cost for classification
+            cost_class = torch.zeros((out_prob.shape[0], tgt_bbox.shape[0]), device=out_prob.device)
 
         # Compute the L1 cost between boxes with error handling
         try:
@@ -229,9 +265,8 @@ class HungarianMatcher(nn.Module):
         
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
-
 def build_matcher(args):
-    return HungarianMatcher(
+    return FixedHungarianMatcher(
         cost_class=args.set_cost_class,
         cost_bbox=args.set_cost_bbox,
         cost_giou=args.set_cost_giou,
